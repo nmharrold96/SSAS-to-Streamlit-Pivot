@@ -1,0 +1,111 @@
+import streamlit as st
+import pandas as pd
+from pyadomd import Pyadomd
+import tempfile
+from pivottablejs import pivot_ui
+
+st.set_page_config(page_title="SSAS Cube Explorer", layout="wide")
+
+# Connection string input
+st.sidebar.header("Connection")
+connection_str = st.sidebar.text_input(
+    "SSAS Connection String",
+    value="Provider=MSOLAP;Data Source=YourServer;Initial Catalog=YourCube;"
+)
+
+# Utility function to run DMV or MDX queries
+def run_query(conn_str, query):
+    with Pyadomd(conn_str) as conn:
+        with conn.cursor().execute(query) as cur:
+            cols = [c.name for c in cur.description]
+            rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=cols)
+
+# DMV metadata fetchers
+def get_measures(conn_str):
+    return run_query(conn_str, "SELECT * FROM $SYSTEM.MDSCHEMA_MEASURES")
+
+def get_dimensions(conn_str):
+    return run_query(conn_str, "SELECT * FROM $SYSTEM.MDSCHEMA_DIMENSIONS")
+
+def get_hierarchies(conn_str):
+    return run_query(conn_str, "SELECT * FROM $SYSTEM.MDSCHEMA_HIERARCHIES")
+
+def get_levels(conn_str):
+    return run_query(conn_str, "SELECT * FROM $SYSTEM.MDSCHEMA_LEVELS")
+
+def get_cubes(conn_str):
+    return run_query(conn_str, "SELECT * FROM $SYSTEM.MDSCHEMA_CUBES")
+
+# --- Sidebar: metadata selectors ---
+st.sidebar.header("Cube Metadata")
+
+if connection_str:
+    try:
+        cubes = get_cubes(connection_str)
+        cube_name = st.sidebar.selectbox("Select Cube", cubes["CUBE_NAME"].unique())
+
+        measures = get_measures(connection_str)
+        measure_choices = measures["MEASURE_NAME"].unique().tolist()
+        selected_measures = st.sidebar.multiselect("Measures", measure_choices)
+
+        dims = get_dimensions(connection_str)
+        dim_choices = dims["DIMENSION_NAME"].unique().tolist()
+        selected_dim = st.sidebar.selectbox("Dimension", dim_choices)
+
+        hier = get_hierarchies(connection_str)
+        hier_choices = hier[hier["DIMENSION_UNIQUE_NAME"] == selected_dim]["HIERARCHY_UNIQUE_NAME"].tolist()
+        selected_hier = st.sidebar.selectbox("Hierarchy", hier_choices)
+
+        levels = get_levels(connection_str)
+        level_choices = levels[levels["HIERARCHY_UNIQUE_NAME"] == selected_hier]["LEVEL_NAME"].tolist()
+        selected_level = st.sidebar.selectbox("Level", level_choices)
+
+    except Exception as e:
+        st.error(f"Error fetching metadata: {e}")
+        cube_name = None
+        selected_measures, selected_level = [], None
+else:
+    cube_name = None
+    selected_measures, selected_level = [], None
+
+# --- Build MDX Query ---
+def build_mdx(cube_name, measures, level):
+    if not cube_name or not measures or not level:
+        return ""
+
+    mdx = f"""
+    SELECT
+        NON EMPTY {{ {', '.join(['[Measures].['+m+']' for m in measures])} }} ON COLUMNS,
+        NON EMPTY {{ {level}.Members }} ON ROWS
+    FROM [{cube_name}]
+    """
+    return mdx
+
+mdx = build_mdx(cube_name, selected_measures, selected_level)
+
+st.subheader("Generated MDX Query")
+st.code(mdx, language="sql")
+
+# --- Execute & Display ---
+if st.button("Run Query"):
+    if mdx:
+        try:
+            df = run_query(connection_str, mdx)
+
+            st.subheader("Raw Results")
+            st.dataframe(df)
+
+            # Interactive Pivot Table
+            st.subheader("Interactive Pivot Table")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmpf:
+                pivot_ui(df, outfile_path=tmpf.name)
+                with open(tmpf.name, "r", encoding="utf-8") as f:
+                    pivot_html = f.read()
+
+            st.components.v1.html(pivot_html, height=600, scrolling=True)
+
+        except Exception as e:
+            st.error(f"Error running query: {e}")
+    else:
+        st.warning("Please select at least one measure and a level.")
